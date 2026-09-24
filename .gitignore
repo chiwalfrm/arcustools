@@ -1,0 +1,18 @@
+# Defensive: this repo ships ONLY .py and .sh under public/ and private/.
+# Ignore everything, then un-ignore the two source dirs and the two extensions.
+*
+!.gitignore
+!README.md
+!public/
+!private/
+public/**
+private/**
+!public/**/*.py
+!public/**/*.sh
+!private/**/*.py
+!private/**/*.sh
+# Never, under any circumstance:
+*.json
+*.log
+__pycache__/
+*.pyc
