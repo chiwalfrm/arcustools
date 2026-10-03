@@ -2,7 +2,7 @@
 
 Command-line tools for the [Arcus](https://arcus.xyz) perpetuals exchange: account and
 market reads, live WebSocket streams, and credentialed trading (order placement, market
-making, monitoring).
+making, TWAP execution, monitoring).
 
 The tools are split into two directories by what they need to run:
 
@@ -25,7 +25,8 @@ API key.
 
 - Trading: `place_order.py`, `cancel_order.py`, `modify_order.py`, `close_position.py`,
   `schedule_cancel.py`
-- Bots / automation: `market_maker.py`, `pivot_trader.py`, `account_poller.py`
+- Bots / automation: `market_maker.py`, `pivot_trader.py`, `twap.py` (TWAP order execution:
+  slices a parent buy/sell into timed child orders), `account_poller.py`
 - Monitoring: `marketdata_monitor.py`, `mm_dashboard.py`, `showlogs.sh`
 - Internals: `ordersign.py` (order signing), `arcus_common_private.py`, `arcus_redis.py`
 
