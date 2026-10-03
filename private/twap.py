@@ -255,6 +255,26 @@ def run_twap(args):
 
     # Resume: fold in prior progress, continue the remainder over the remaining slices.
     prev = load_state(path) if args.resume else None
+    if prev is not None:
+        # Consistency guard: the state file is the progress of ONE specific parent order. Refuse to continue it
+        # with a different size-mode / target / slice count -- the target + count come from the CLI args (only
+        # progress comes from the file), so a mismatch would silently miscompute the remaining quantity.
+        mism = []
+        if bool(prev.get("usd_mode")) != usd_mode:
+            mism.append(f"size mode (state={'usd' if prev.get('usd_mode') else 'base'}, "
+                        f"now={'usd' if usd_mode else 'base'})")
+        else:
+            stored = dec(prev.get("target_usd")) if usd_mode else dec(prev.get("target_base"))
+            nowt = target_usd if usd_mode else target_base
+            flag = "--quantityusd" if usd_mode else "--quantity"
+            if stored is None or stored != nowt:
+                mism.append(f"{flag} (state={_plain(stored)}, now={_plain(nowt)})")
+        if int(prev.get("slices", -1)) != args.slices:
+            mism.append(f"--slices (state={prev.get('slices')}, now={args.slices})")
+        if mism:
+            raise SystemExit(f"{PROG}: --resume args don't match state file {os.path.basename(path)}: "
+                             + "; ".join(mism) + f".\n  Re-run with the SAME parameters as the interrupted run, "
+                             f"or delete {os.path.basename(path)} to start fresh.")
     done_base = (dec(prev.get("filled_base")) or Decimal(0)) if prev else Decimal(0)
     done_usd = (dec(prev.get("filled_usd")) or Decimal(0)) if prev else Decimal(0)
     slices_done = int(prev.get("slices_done", 0)) if prev else 0
@@ -364,7 +384,7 @@ def run_twap(args):
             if (side == "BUY" and px > args.limit_price) or (side == "SELL" and px < args.limit_price):
                 log(f"[{name}] slice {slice_no}: ref {_plain(px)} violates --limit-price "
                     f"{_plain(args.limit_price)} -- skipping (carried forward).")
-                _sleep_to(start, i + 1, interval, stop)
+                _sleep_to(start, i - slices_done + 1, interval, stop)
                 continue
 
         cid = f"twap-{int(time.time())}-{slice_no}"[:36]
@@ -377,7 +397,7 @@ def run_twap(args):
                 f"{result['slippage'] * 100:.2f}% > --max-slippage {max_slip * 100:.2f}% (already sent).")
         if not result["placed"]:
             log(f"[{name}] slice {slice_no}: NOT placed ({result['reason']}) -- carried forward.")
-            _sleep_to(start, i + 1, interval, stop)
+            _sleep_to(start, i - slices_done + 1, interval, stop)
             continue
 
         order = result["order"] or {}
@@ -402,7 +422,7 @@ def run_twap(args):
         log(f"[{name}] slice {slice_no}/{args.slices}: {side} {_plain(slice_base)} @ ~{_plain(price)} "
             f"(filled {_plain(filled)}{short}); cumulative {_plain(filled_base)} base.")
 
-        _sleep_to(start, i + 1, interval, stop)
+        _sleep_to(start, i - slices_done + 1, interval, stop)
 
     # ── final report ────────────────────────────────────────────────────────────────────────────────
     vwap = (filled_usd / filled_base) if filled_base > 0 else None
