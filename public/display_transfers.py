@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal
 from functools import partial
-from arcus_common_public import print_verbose_records, write_verbose_csv, TABLE_MAX_ROWS, add_network_args, require_eth_address, run_pipe_safe, NETWORKS, UNLIMITED, dec, dedup_vs_previous_page, id_or_json_key, epoch_us_arg, get_json_dict, limit_arg, page_pace_delay, when   # shared public helpers (formerly local copies)
+from arcus_common_public import print_verbose_records, write_verbose_csv, TABLE_MAX_ROWS, add_network_args, require_eth_address, run_pipe_safe, NETWORKS, UNLIMITED, dec, id_or_json_key, epoch_us_arg, get_json_dict, limit_arg, page_pace_delay, when   # shared public helpers (formerly local copies)
 
 _gjd = partial(get_json_dict, prog="display_transfers")   # get_json + require_dict, this tool's prog
 INFINITE_RETRY = False    # set by --infinite-retry: retry TRANSIENT fetch failures forever (never give up on a huge export)
@@ -54,7 +54,12 @@ def _get_json(url, what, **kw):
 
 
 BASE = None
-PAGE_SIZE = 1000
+PAGE_SIZE = 1000          # API max rows per request (honored ONLY when `from` is a valid timestamp -- see below).
+# ★ /v1/accountTransferUpdates applies a DEFAULT RECENT WINDOW when `from` is omitted OR 0 (0 is treated as
+# "unset"): you get a small recent slice, NOT full history (observed: 23 rows on an account with 38), and `total`
+# just echoes the returned count. A valid far-past `from` escapes the window and makes `limit` honored (one request
+# returned all 38), so every request sends `from` = --from or HISTORY_FROM_US when unset. (from=1 is a 400.)
+HISTORY_FROM_US = 1600000000000000   # 2020-09-13 UTC, in epoch MICROseconds
 INFLOW_TYPES = {"DEPOSIT", "REFERRAL_CLAIM"}
 CONDENSED_KEYS = ["id", "createdAt", "type", "status", "accountIndex", "amount"]  # amount = SIGNED
 
@@ -66,44 +71,30 @@ def created_us(row):
         return -1
 
 
-def fetch_transfers(address, limit, from_us=None, to_us=None):
-    """GET /v1/accountTransferUpdates (newest-first), a single bounded page (mirrors --limit N on the
-    sibling display tools). from_us/to_us are epoch MICROseconds (the from/to unit, same as createdAt).
-    Returns the rows list (non-dicts dropped)."""
-    q = {"address": address, "limit": limit}
-    if from_us is not None:
-        q["from"] = from_us
-    if to_us is not None:
-        q["to"] = to_us
-    data = _get_json(f"{BASE}/v1/accountTransferUpdates?{urllib.parse.urlencode(q)}", "transfers")
-    rows = data.get("accountTransferUpdates")
-    if rows is None:
-        return []
-    if not isinstance(rows, list):
-        raise SystemExit("display_transfers: unexpected response ('accountTransferUpdates' is not a list).")
-    return [r for r in rows if isinstance(r, dict)]   # drop any non-dict element so downstream .get() can't crash
-
-
 def iter_transfers_pages(address, from_us=None, to_us=None):
-    """ALL transfer updates for the address, as a GENERATOR: yield each page's FRESH (deduped) rows LIST,
-    newest-first, paging BACKWARD via the `to` cursor -- so a caller can STREAM one page at a time. from/to/
-    createdAt are all epoch MICROseconds (same unit), so the cursor is the oldest createdAt directly -- NO
-    conversion. `to` is INCLUSIVE, so the boundary row re-reads next page; dedup by id drops it -- against the
-    PREVIOUS page ONLY (the cursor strictly decreases, so page N+1 overlaps only page N -> bounded memory, not
-    O(total)). `from` (server-side) is a lower bound; sent as 0 unless given, so no default window truncates.
-    NB the TOOL (main) still BUFFERS: `signed_amount` needs `own_wire_ids` learned from the WHOLE set (to sign a
-    SELF_ACCOUNT_TRANSFER), so no row's amount can be emitted until every row is scanned. fetch_transfers_all()
-    flattens this."""
-    prev_keys, cursor = set(), to_us
-    eff_from = from_us if from_us is not None else 0
+    """ALL transfer updates for the address, as a GENERATOR: yield each page's NEW rows LIST, paging BACKWARD via
+    the `to` cursor. from/to/createdAt are epoch MICROseconds.
+
+    The PRIMARY fix (shared with the siblings): send a valid far-past `from` floor (HISTORY_FROM_US when --from is
+    unset) -- `from` omitted/0 gives a default recent window, so this is what makes `limit` honored and full history
+    reachable. With that, one request returns everything for a normal account (e.g. all 38), and the `<PAGE_SIZE`
+    break ends paging correctly.
+
+    TRANSFERS-ONLY extra guard: should an account ever exceed one page (>1000 transfers) and need the `to` cursor,
+    note this endpoint's `to` is ERRATIC -- pages OVERLAP NON-ADJACENTLY (a row seen on page 1 can reappear on page 3),
+    so the previous-page-only `dedup_vs_previous_page` used by fills/funding/orders is NOT safe here. This pager keeps
+    a GLOBAL `seen` set (bounded -- transfers are few per account, not the millions of fills) and advances the cursor
+    by the whole page's min createdAt, forced strictly older if it stalls, stopping when a page yields ZERO new ids.
+    NB the TOOL (main) already BUFFERS the whole set (own_wire_ids for signed amounts). fetch_transfers_all() flattens."""
+    seen, cursor = set(), to_us
+    eff_from = from_us if from_us else HISTORY_FROM_US   # 0/unset -> default window, so force a real floor
     first = True
     while True:
         q = {"address": address, "limit": PAGE_SIZE, "from": eff_from}
         if cursor is not None:
             q["to"] = cursor
-        # Pace pages AFTER the first: a full 1000-row list page costs ~70 IP-weight and the per-IP bucket
-        # refills 25/s, so unpaced back-to-back paging drives the bucket negative -> 429. First page rides
-        # the already-full bucket (no pause).
+        # Pace pages AFTER the first: a full page costs ~70 IP-weight and the per-IP bucket refills 25/s, so
+        # unpaced back-to-back paging drives the bucket negative -> 429. First page rides the full bucket (no pause).
         data = _get_json(f"{BASE}/v1/accountTransferUpdates?{urllib.parse.urlencode(q)}", "transfers",
                          delay=(0.0 if first else page_pace_delay()))
         first = False
@@ -114,21 +105,33 @@ def iter_transfers_pages(address, from_us=None, to_us=None):
             raise SystemExit("display_transfers: unexpected response ('accountTransferUpdates' is not a list).")
         if not rows:
             break
-        # Dedup by id (id-less row -> full-row JSON) against the PREVIOUS page only: the inclusive `to` cursor
-        # re-reads just the boundary microsecond, which strictly decreases, so page N+1 overlaps ONLY page N --
-        # bounded to ~one page, not O(total). (See dedup_vs_previous_page.)
-        fresh, prev_keys = dedup_vs_previous_page(rows, prev_keys, lambda r: id_or_json_key(r, "id"))
+        # GLOBAL dedup by id (id-less row -> full-row JSON): the `to` cursor overlaps non-adjacently, so a
+        # previous-page-only set would re-emit rows. Track min createdAt over the WHOLE page (not just new rows)
+        # so the cursor still advances even on an all-overlap page.
+        fresh, page_min = [], None
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            ca = created_us(r)
+            if ca > 0:
+                page_min = ca if page_min is None else min(page_min, ca)
+            k = id_or_json_key(r, "id")
+            if k in seen:
+                continue
+            seen.add(k)
+            fresh.append(r)
         if fresh:
             yield fresh
-        if len(rows) < PAGE_SIZE:      # fewer than a full page -> reached the oldest / `from`
+        if len(rows) < PAGE_SIZE:        # with a real `from`, the API honors the limit -> a short page is the end
             break
-        if not fresh:                   # no new ids -> stop, never loop
+        if not fresh:                    # a full page with NO new ids -> every reachable row has been seen
             break
-        positives = [c for c in (created_us(r) for r in rows) if c > 0]
-        if not positives:
+        if page_min is None:
             break
-        nc = min(positives)              # oldest createdAt (epoch MICROseconds) -> `to` for the next page, inclusive
-        if cursor is not None and nc >= cursor:    # cursor didn't decrease -> avoid an infinite loop
+        nc = page_min                    # oldest createdAt this page -> `to` for the next page (inclusive)
+        if cursor is not None and nc >= cursor:
+            nc = cursor - 1              # cursor stuck -> force it strictly older (µs) so paging can't loop
+        if nc < 0:
             break
         cursor = nc
 
@@ -137,6 +140,22 @@ def fetch_transfers_all(address, from_us=None, to_us=None):
     """ALL transfer updates for the address, COLLECTED into one list -- the tool needs the full set (own_wire_ids
     for signed amounts, plus the table's widths/sort/totals). Streaming callers use iter_transfers_pages()."""
     return [r for page in iter_transfers_pages(address, from_us, to_us) for r in page]
+
+
+def fetch_transfers(address, limit, from_us=None, to_us=None):
+    """Bounded --limit N: ONE request. With a real `from` floor (HISTORY_FROM_US when --from is unset) the API
+    HONORS `limit` and returns the newest N across ALL history (not the default recent window). Returns the rows
+    list (non-dicts dropped)."""
+    q = {"address": address, "limit": limit, "from": from_us if from_us else HISTORY_FROM_US}
+    if to_us is not None:
+        q["to"] = to_us
+    data = _get_json(f"{BASE}/v1/accountTransferUpdates?{urllib.parse.urlencode(q)}", "transfers")
+    rows = data.get("accountTransferUpdates")
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise SystemExit("display_transfers: unexpected response ('accountTransferUpdates' is not a list).")
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def is_applied(row):
@@ -235,7 +254,7 @@ def main():
         truncated = False                          # paginated to completeness (within --from/--to)
     else:
         raw = fetch_transfers(args.address, args.limit, args.from_us, args.to_us)
-        truncated = len(raw) >= args.limit         # a full page back -> older rows may exist -> NET is partial
+        truncated = len(raw) >= args.limit         # a full page (limit honored via the `from` floor) -> older rows exist -> NET partial
     if len(raw) > TABLE_MAX_ROWS:
         raise SystemExit(
             f"display_transfers: too many transfers to buffer (> {TABLE_MAX_ROWS:,}). This tool holds the full set "

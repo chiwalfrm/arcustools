@@ -384,7 +384,8 @@ def run_twap(args):
             if (side == "BUY" and px > args.limit_price) or (side == "SELL" and px < args.limit_price):
                 log(f"[{name}] slice {slice_no}: ref {_plain(px)} violates --limit-price "
                     f"{_plain(args.limit_price)} -- skipping (carried forward).")
-                _sleep_to(start, i - slices_done + 1, interval, stop)
+                if i < args.slices - 1:            # no pacing wait after the final slice
+                    _sleep_to(start, i - slices_done + 1, interval, stop)
                 continue
 
         cid = f"twap-{int(time.time())}-{slice_no}"[:36]
@@ -397,7 +398,8 @@ def run_twap(args):
                 f"{result['slippage'] * 100:.2f}% > --max-slippage {max_slip * 100:.2f}% (already sent).")
         if not result["placed"]:
             log(f"[{name}] slice {slice_no}: NOT placed ({result['reason']}) -- carried forward.")
-            _sleep_to(start, i - slices_done + 1, interval, stop)
+            if i < args.slices - 1:            # no pacing wait after the final slice
+                _sleep_to(start, i - slices_done + 1, interval, stop)
             continue
 
         order = result["order"] or {}
@@ -422,7 +424,8 @@ def run_twap(args):
         log(f"[{name}] slice {slice_no}/{args.slices}: {side} {_plain(slice_base)} @ ~{_plain(price)} "
             f"(filled {_plain(filled)}{short}); cumulative {_plain(filled_base)} base.")
 
-        _sleep_to(start, i - slices_done + 1, interval, stop)
+        if i < args.slices - 1:            # no pacing wait after the final slice
+            _sleep_to(start, i - slices_done + 1, interval, stop)
 
     # ── final report ────────────────────────────────────────────────────────────────────────────────
     vwap = (filled_usd / filled_base) if filled_base > 0 else None

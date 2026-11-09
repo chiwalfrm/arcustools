@@ -39,7 +39,12 @@ from arcus_common_public import (resolve_market_name, stream_condensed_pages, st
                                  epoch_us_arg, get_json_dict, limit_arg, page_pace_delay, updated_key, when)   # shared public helpers
 
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
-PAGE_SIZE = 1000          # API max per request; page size used by --limit unlimited
+PAGE_SIZE = 1000          # API max rows per request (honored ONLY when `from` is a valid timestamp -- see below).
+# ★ /v1/orders & /v1/openOrders apply a DEFAULT RECENT WINDOW when `from` is omitted OR 0 (0 is treated as
+# "unset"): you get a small recent slice, NOT full history, even with limit=1000. A valid far-past `from` escapes
+# the window and makes `limit` honored, so every request sends `from` = --from or HISTORY_FROM_US when unset.
+# (from=1 is a 400; this is a safely-old but valid epoch-µs floor before any Arcus data.)
+HISTORY_FROM_US = 1600000000000000   # 2020-09-13 UTC, in epoch MICROseconds
 INFINITE_RETRY = False    # set by --infinite-retry: retry TRANSIENT fetch failures forever (never give up on a huge export)
 
 # Status values the venue can report, per the order schema.
@@ -121,9 +126,7 @@ def fetch_page(path_seg, address, limit, from_us=None, to_us=None, delay=0.0, ma
     MICROseconds bounding the endpoint's window field (updatedAt for orders, createdAt for openOrders).
     market/side/status are SERVER-SIDE filters (v1.4.5/v1.6.0/v1.7.1); openOrders ignores `side` (the caller
     filters it locally) and is the whole live set so it is passed no `status`."""
-    q = {"address": address, "limit": limit}
-    if from_us is not None:
-        q["from"] = from_us
+    q = {"address": address, "limit": limit, "from": from_us if from_us else HISTORY_FROM_US}
     if to_us is not None:
         q["to"] = to_us
     if market is not None:
@@ -169,9 +172,9 @@ def iter_pages(path_seg, cursor_key, address, from_us=None, to_us=None, market=N
         fresh, prev_keys = dedup_vs_previous_page(page, prev_keys, lambda o: id_or_json_key(o, "orderId"))
         if fresh:
             yield fresh                 # STREAM this page's fresh orders to the caller before the next
-        if len(page) < PAGE_SIZE:        # fewer than a full page -> reached the oldest order / `from`
+        if len(page) < PAGE_SIZE:        # with a real `from`, the API honors the limit -> a short page is the end
             break
-        if not fresh:                    # no new orderIds -> stop, never loop
+        if not fresh:                    # no new orderIds (boundary page fully deduped) -> reached the oldest order
             break
         positives = [c for c in (cursor_key(o) for o in page) if c > 0]
         if not positives:                # nothing with a usable timestamp to advance the cursor
@@ -335,7 +338,7 @@ def main():
         truncated = False                         # paginated to completeness (within --from/--to)
     else:
         raw = fetch_page(path_seg, args.address, args.limit, args.from_us, args.to_us, market=target_name, side=args.side, status=server_status)
-        truncated = len(raw) >= args.limit        # a full page back -> older orders may exist
+        truncated = len(raw) >= args.limit        # a full page (limit honored via the `from` floor) -> older orders may exist
     if len(raw) > TABLE_MAX_ROWS:
         raise SystemExit(
             f"display_orders: too many orders for a table (buffered > {TABLE_MAX_ROWS:,}). The table mode holds the "

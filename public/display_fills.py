@@ -37,7 +37,13 @@ def _get_json(url, what, **kw):
 
 
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
-PAGE_SIZE = 1000          # API max per request; page size used by --limit unlimited
+PAGE_SIZE = 1000          # API max rows per request (honored ONLY when `from` is a valid timestamp -- see below).
+# ★ The /v1 list endpoints apply a DEFAULT RECENT WINDOW when `from` is omitted OR 0 (0 is treated as "unset"):
+# you then get a small recent slice (~hundreds), NOT the full history, even with limit=1000 -- and `total` lies
+# (it just echoes the returned count). Passing a valid far-past `from` escapes that window and makes `limit`
+# honored. So every request sends `from` = the caller's --from, or HISTORY_FROM_US when unset. (from=1 is a 400;
+# this value is a safely-old but valid epoch-µs floor, well before any Arcus data.)
+HISTORY_FROM_US = 1600000000000000   # 2020-09-13 UTC, in epoch MICROseconds
 
 # Fields emitted by --condensed (raw, one CSV row per fill; no header, per the display_* convention).
 # liquidationMethod/liquidatedUser (the v1.3.5 forced-fill marker) are APPENDED at the END so positional
@@ -61,30 +67,6 @@ def _annotate_liq(f):
     return f
 
 
-def fetch_fills(address, limit, from_us=None, to_us=None, market=None, role=None, side=None):
-    """GET /v1/fills (newest-first). Validates the response shape and returns the fills list.
-    from_us/to_us are epoch MICROseconds (the /v1/fills from/to unit, same as createdAt). `market` is
-    the canonical marketDisplayName for the SERVER-SIDE market filter (v1.2.1); None = all markets."""
-    q = {"address": address, "limit": limit}
-    if from_us is not None:
-        q["from"] = from_us
-    if to_us is not None:
-        q["to"] = to_us
-    if market is not None:
-        q["market"] = market
-    if role is not None:
-        q["role"] = role
-    if side is not None:
-        q["side"] = side
-    data = _get_json(f"{BASE}/v1/fills?{urllib.parse.urlencode(q)}", "fills")
-    fills = data.get("fills")
-    if fills is None:
-        return []
-    if not isinstance(fills, list):
-        raise SystemExit("display_fills: unexpected /v1/fills response ('fills' is not a list).")
-    return [_annotate_liq(f) for f in fills if isinstance(f, dict)]   # drop non-dicts; flatten the v1.3.5 liquidation marker
-
-
 def iter_fills_pages(address, from_us=None, to_us=None, market=None, role=None, side=None):
     """--limit unlimited, as a GENERATOR: yield each page's FRESH (deduped) fills LIST, newest-first, as it
     pages BACKWARD via the `to` cursor -- so a caller can STREAM output instead of buffering the whole history
@@ -98,11 +80,10 @@ def iter_fills_pages(address, from_us=None, to_us=None, market=None, role=None, 
     # boundary microsecond, and the cursor STRICTLY decreases (nc >= cursor breaks), so page N+1 can overlap only
     # page N. A global seen-set would grow to O(total fills) (~6M ids ≈ 600MB, swap-thrash on a small host).
     prev_keys, cursor = set(), to_us
+    eff_from = from_us if from_us else HISTORY_FROM_US   # 0/unset -> default window, so force a real floor
     first = True
     while True:
-        q = {"address": address, "limit": PAGE_SIZE}
-        if from_us is not None:
-            q["from"] = from_us
+        q = {"address": address, "limit": PAGE_SIZE, "from": eff_from}
         if cursor is not None:
             q["to"] = cursor
         if market is not None:
@@ -130,9 +111,9 @@ def iter_fills_pages(address, from_us=None, to_us=None, market=None, role=None, 
         fresh, prev_keys = dedup_vs_previous_page(fills, prev_keys, lambda f: id_or_json_key(f, "tradeId"))
         if fresh:
             yield [_annotate_liq(f) for f in fresh]   # STREAM this page's fresh fills (liquidation marker flattened)
-        if len(fills) < PAGE_SIZE:      # fewer than a full page -> reached the oldest fill / `from`
+        if len(fills) < PAGE_SIZE:       # with a real `from`, the API honors the limit -> a short page is the end
             break
-        if not fresh:                    # no new tradeIds -> stop, never loop
+        if not fresh:                    # no new tradeIds (boundary page fully deduped) -> reached the oldest fill
             break
         positives = [c for c in (created_key(f) for f in fills if isinstance(f, dict)) if c > 0]
         if not positives:                # nothing with a usable timestamp to advance the cursor
@@ -149,7 +130,29 @@ def fetch_fills_all(address, from_us=None, to_us=None, market=None, role=None, s
     return [f for page in iter_fills_pages(address, from_us, to_us, market, role, side) for f in page]
 
 
-def print_table(fills, address, label, note):
+def fetch_fills(address, limit, from_us=None, to_us=None, market=None, role=None, side=None):
+    """Bounded --limit N: ONE request. With a real `from` floor (HISTORY_FROM_US when --from is unset) the API
+    HONORS `limit` and returns the newest N across ALL history (not a default recent window), so one page suffices
+    for a bounded fetch. Returns the fills list (newest-first)."""
+    q = {"address": address, "limit": limit, "from": from_us if from_us else HISTORY_FROM_US}
+    if to_us is not None:
+        q["to"] = to_us
+    if market is not None:
+        q["market"] = market
+    if role is not None:
+        q["role"] = role
+    if side is not None:
+        q["side"] = side
+    data = _get_json(f"{BASE}/v1/fills?{urllib.parse.urlencode(q)}", "fills")
+    fills = data.get("fills")
+    if fills is None:
+        return []
+    if not isinstance(fills, list):
+        raise SystemExit("display_fills: unexpected /v1/fills response ('fills' is not a list).")
+    return [_annotate_liq(f) for f in fills if isinstance(f, dict)]
+
+
+def print_table(fills, address, label, note, truncated=False):
     """Aligned table with column widths sized to the data, plus a fee/PnL totals footer."""
     # (header, alignment, value-getter). closedPnl/positionEffect are optional on REST -> "".
     cols = [
@@ -178,7 +181,12 @@ def print_table(fills, address, label, note):
     total_fee = sum((dec(f.get("fee")) or Decimal(0)) for f in fills)
     total_pnl = sum((dec(f.get("closedPnl")) or Decimal(0)) for f in fills)
     print("-" * len(head))
-    print(f"  TOTAL  fees {total_fee:,.6f}   realized PnL {total_pnl:,.6f}   over {len(fills)} fill(s)")
+    if truncated:
+        # These sums cover ONLY the latest N fills shown, NOT the account's full history -- never call that "TOTAL".
+        print(f"  SUBTOTAL (latest {len(fills)} fills shown -- NOT full history; use --limit unlimited)  "
+              f"fees {total_fee:,.6f}   realized PnL {total_pnl:,.6f}")
+    else:
+        print(f"  TOTAL  fees {total_fee:,.6f}   realized PnL {total_pnl:,.6f}   over {len(fills)} fill(s)")
 
 
 def main():
@@ -253,7 +261,7 @@ def main():
         truncated = False                         # paginated to completeness (within --from/--to + --market)
     else:
         raw = fetch_fills(args.address, args.limit, args.from_us, args.to_us, market=target_name, role=args.role, side=args.side)
-        truncated = len(raw) >= args.limit        # a full page back -> older fills may exist
+        truncated = len(raw) >= args.limit        # a full page (limit honored via the `from` floor) -> older fills may exist
     if len(raw) > TABLE_MAX_ROWS:
         raise SystemExit(
             f"display_fills: too many fills for a table (buffered > {TABLE_MAX_ROWS:,}). The table mode holds the "
@@ -278,7 +286,7 @@ def main():
     if args.verbose:   # block dump: EVERY field of each fill (buffered set, like the table)
         print_verbose_records(fills, f"{len(fills)} fill(s) [{label}] for {args.address}{note}", time_keys={"createdAt"})
     else:
-        print_table(fills, args.address, label, note)
+        print_table(fills, args.address, label, note, truncated=truncated)
 
 
 if __name__ == "__main__":

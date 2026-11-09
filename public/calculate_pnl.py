@@ -14,7 +14,7 @@ so the result doesn't depend on the venue's accounting -- useful as a cross-chec
 Output: a human-readable summary by default. With --condensed, one comma-delimited (CSV) line
 intended for other programs to parse (arcus market names never contain commas, unlike dydxv4
 tickers which force pipe) --
-    openRemaining,market,avgOpenPrice,realizedPnL,latestPrice,unrealizedPnL,totalFees,totalVolume
+    openRemaining,market,avgOpenPrice,realizedPnL,latestPrice,unrealizedPnL,totalFees,totalVolume,venueRealizedPnL
       openRemaining  net remaining position after FIFO (signed: + long, - short), in coin
       avgOpenPrice   size-weighted avg price of the REMAINING open lots only (0 if flat)
       realizedPnL    FIFO realized PnL, gross/price-only (fees are NOT deducted; see totalFees)
@@ -22,6 +22,9 @@ tickers which force pipe) --
       unrealizedPnL  (latestPrice - avgOpenPrice) * openRemaining
       totalFees      sum of every fill's fee
       totalVolume    sum of size*price over every fill -- notional in USD, NOT coin quantity
+      venueRealizedPnL  sum of the venue's own per-fill closedPnl (fees + liquidation accounting baked in) --
+                        a CROSS-CHECK against the price-only realizedPnL above, NOT part of the FIFO math; the
+                        two diverge on liquidated positions (liquidation penalties live only in closedPnl)
 
 IMPORTANT -- the fills file must be COMPLETE from the position's inception for FIFO to be correct.
 display_fills defaults to the newest 1000; use `--limit unlimited` (and/or --from/--to) so the file
@@ -47,7 +50,8 @@ get_json = partial(get_json_dict, prog="calculate_pnl")   # get_json + require_d
 
 # display_fills --condensed CONDENSED_KEYS positions.
 C_CREATED, C_MARKET, C_SIDE, C_SIZE, C_PRICE, C_FEE = 0, 1, 2, 3, 4, 5
-MIN_FIELDS = C_FEE + 1     # need at least through the fee column
+C_CLOSEDPNL = 7            # the venue's own per-fill realized PnL (optional: absent on pre-field rows -> 0)
+MIN_FIELDS = C_FEE + 1     # need at least through the fee column (closedPnl is optional, read only if present)
 
 
 def price_arg(s):
@@ -73,7 +77,7 @@ def fmt_cents(d, sign=False):
     return "0.00" if s.lstrip("+-") == "0.00" else s
 
 
-def print_human(market, remaining, avg, realized, latest, unrealized, fees, volume, price_src):
+def print_human(market, remaining, avg, realized, latest, unrealized, fees, volume, venue_realized, price_src):
     """Readable summary (default output). --condensed emits the machine line instead."""
     base = market.split("-")[0] if "-" in market else market
     print()
@@ -90,6 +94,8 @@ def print_human(market, remaining, avg, realized, latest, unrealized, fees, volu
     print(f"  Unrealized PnL (FIFO)     {fmt_cents(unrealized, sign=True)}")
     print(f"  Total fees                {fmt_cents(fees)}")
     print(f"  Total volume (USD)        {fmt_cents(volume)}")
+    print(f"  Venue realized PnL        {fmt_cents(venue_realized, sign=True)}   (sum of per-fill closedPnl; "
+          f"incl. fees + liquidation accounting -- cross-check, not FIFO)")
     print()
 
 
@@ -124,8 +130,12 @@ def _parse_fill(parts, lineno, want_market):
         created = int(created_s)
     except (TypeError, ValueError):
         created = -1                                            # unparseable time -> sort oldest
+    # closedPnl is the venue's own per-fill realized PnL (includes fees + liquidation accounting). OPTIONAL:
+    # absent on pre-field rows -> 0. We SUM it for a reporting cross-check; it does NOT feed the FIFO math.
+    closed = dec(parts[C_CLOSEDPNL]) if len(parts) > C_CLOSEDPNL else None
     return {"created": created, "market": market, "side": side,
-            "size": size, "price": price, "fee": fee if fee is not None else Decimal(0)}
+            "size": size, "price": price, "fee": fee if fee is not None else Decimal(0),
+            "closed": closed if closed is not None else Decimal(0)}
 
 
 def read_fills(fh, want_market):
@@ -227,10 +237,11 @@ class NotMonotonic(Exception):
 def compute_pnl(fills, guard_monotonic):
     """ONE pass over `fills` (an iterable of fill dicts, OLDEST-first) computing FIFO realized PnL +
     fee/volume totals with O(1) memory aside from the open-lot deque. Returns
-    (realized, remaining, avg, total_fees, total_volume, market, n). Raises NotMonotonic when
-    guard_monotonic and a createdAt decreases (input not newest-first)."""
+    (realized, remaining, avg, total_fees, total_volume, total_closed, market, n). Raises NotMonotonic when
+    guard_monotonic and a createdAt decreases (input not newest-first). `total_closed` is the sum of the venue's
+    own per-fill closedPnl (fees + liquidation accounting baked in) -- a cross-check, NOT part of the FIFO math."""
     lots = deque()                              # each: [signed_qty, price]; all entries share the position's sign
-    realized = total_fees = total_volume = Decimal(0)
+    realized = total_fees = total_volume = total_closed = Decimal(0)
     market, n, prev = None, 0, None
     for f in fills:
         c = f["created"]
@@ -241,9 +252,10 @@ def compute_pnl(fills, guard_monotonic):
         realized = fifo_step(lots, realized, q, f["price"])
         total_fees += f["fee"]
         total_volume += f["size"] * f["price"]
+        total_closed += f["closed"]
     remaining = sum((lot[0] for lot in lots), Decimal(0))
     avg = sum((lot[0] * lot[1] for lot in lots), Decimal(0)) / remaining if remaining != 0 else Decimal(0)
-    return realized, remaining, avg, total_fees, total_volume, market, n
+    return realized, remaining, avg, total_fees, total_volume, total_closed, market, n
 
 
 def fetch_oracle_price(base, market):
@@ -295,11 +307,11 @@ def main():
         try:
             market = want or resolve_market(scan_markets(args.file, want))
             r = compute_pnl(parsed_fills(reversed_lines(args.file), market), guard_monotonic=True)
-            if r[6] == 0:                        # n == 0 -> nothing matched
+            if r[7] == 0:                        # n == 0 -> nothing matched
                 raise SystemExit("calculate_pnl: no fills parsed from input"
                                  + (f" for market {market}" if want else "") + ".")
-            realized, remaining, avg, total_fees, total_volume = r[0], r[1], r[2], r[3], r[4]
-            result = (realized, remaining, avg, total_fees, total_volume, market)
+            realized, remaining, avg, total_fees, total_volume, total_closed = r[0], r[1], r[2], r[3], r[4], r[5]
+            result = (realized, remaining, avg, total_fees, total_volume, total_closed, market)
         except NotMonotonic:
             print("calculate_pnl: WARNING input is not in display_fills (newest-first) order; falling back "
                   "to a buffered sort (memory grows with the file).", file=sys.stderr)
@@ -324,10 +336,10 @@ def main():
         fills.reverse()
         fills.sort(key=lambda f: f["created"])
         r = compute_pnl(iter(fills), guard_monotonic=False)
-        realized, remaining, avg, total_fees, total_volume = r[0], r[1], r[2], r[3], r[4]
-        result = (realized, remaining, avg, total_fees, total_volume, market)
+        realized, remaining, avg, total_fees, total_volume, total_closed = r[0], r[1], r[2], r[3], r[4], r[5]
+        result = (realized, remaining, avg, total_fees, total_volume, total_closed, market)
 
-    realized, remaining, avg, total_fees, total_volume, market = result
+    realized, remaining, avg, total_fees, total_volume, total_closed, market = result
     latest = args.price if args.price is not None else fetch_oracle_price(NETWORKS[args.network], market)
     unrealized = (latest - avg) * remaining          # signed remaining handles long/short
 
@@ -337,11 +349,11 @@ def main():
         w = csv.writer(sys.stdout, lineterminator="\n")
         if args.header:
             w.writerow(["remaining", "market", "avgOpenPrice", "realizedPnl",
-                        "latestPrice", "unrealizedPnl", "totalFees", "totalVolume"])
-        w.writerow([remaining, market, avg, realized, latest, unrealized, total_fees, total_volume])
+                        "latestPrice", "unrealizedPnl", "totalFees", "totalVolume", "venueRealizedPnl"])
+        w.writerow([remaining, market, avg, realized, latest, unrealized, total_fees, total_volume, total_closed])
     else:
         price_src = "--price override" if args.price is not None else f"{args.network} oracle"
-        print_human(market, remaining, avg, realized, latest, unrealized, total_fees, total_volume, price_src)
+        print_human(market, remaining, avg, realized, latest, unrealized, total_fees, total_volume, total_closed, price_src)
 
 
 if __name__ == "__main__":

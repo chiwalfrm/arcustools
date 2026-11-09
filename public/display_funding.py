@@ -41,7 +41,12 @@ def _get_json(url, what, **kw):
 
 
 BASE = None   # set in main() from the required --testnet/--staging/--mainnet selector
-PAGE_SIZE = 1000          # API max per request; page size used by --limit unlimited
+PAGE_SIZE = 1000          # API max rows per request (honored ONLY when `from` is a valid timestamp -- see below).
+# ★ /v1/funding applies a DEFAULT RECENT WINDOW when `from` is omitted OR 0 (0 is treated as "unset"): you get a
+# small recent slice, NOT full history, even with limit=1000 -- and `total` just echoes the returned count. A valid
+# far-past `from` escapes the window and makes `limit` honored, so every request sends `from` = --from or
+# HISTORY_FROM_US when unset. (from=1 is a 400; this is a safely-old but valid epoch-µs floor before any Arcus data.)
+HISTORY_FROM_US = 1600000000000000   # 2020-09-13 UTC, in epoch MICROseconds
 
 # Fields emitted by --condensed (raw, one CSV row per payment; no header, per the display_* convention).
 CONDENSED_KEYS = ["time", "marketDisplayName", "fundingRate", "size", "payment"]
@@ -53,25 +58,6 @@ def time_key(payment):
         return int(payment.get("time"))
     except (TypeError, ValueError):
         return -1
-
-
-def fetch_funding(address, limit, from_us=None, to_us=None, market=None):
-    """GET /v1/funding (newest-first). Validates the response shape and returns the payments list. `market`
-    is the canonical marketDisplayName for the SERVER-SIDE market filter (v1.4.8); None = all markets."""
-    q = {"address": address, "limit": limit}
-    if from_us is not None:
-        q["from"] = from_us
-    if to_us is not None:
-        q["to"] = to_us
-    if market is not None:
-        q["market"] = market
-    data = _get_json(f"{BASE}/v1/funding?{urllib.parse.urlencode(q)}", "funding")
-    payments = data.get("fundingPayments")
-    if payments is None:
-        return []
-    if not isinstance(payments, list):
-        raise SystemExit("display_funding: unexpected /v1/funding response ('fundingPayments' is not a list).")
-    return [p for p in payments if isinstance(p, dict)]   # drop any non-dict element so downstream .get() can't crash
 
 
 def iter_funding_pages(address, from_us=None, to_us=None, market=None):
@@ -87,7 +73,7 @@ def iter_funding_pages(address, from_us=None, to_us=None, market=None):
     # `to` is inclusive so page N+1 re-reads only the boundary microsecond, and the cursor STRICTLY decreases
     # (nc >= cursor breaks), so page N+1 can overlap only page N.
     prev_keys = set()
-    eff_from = from_us if from_us is not None else 0
+    eff_from = from_us if from_us else HISTORY_FROM_US   # 0/unset -> default window, so force a real floor
     cursor = to_us
     first = True
     while True:
@@ -115,14 +101,14 @@ def iter_funding_pages(address, from_us=None, to_us=None, market=None):
             payments, prev_keys, lambda p: (p.get("marketDisplayName"), p.get("time")) if isinstance(p, dict) else None)
         if fresh:
             yield fresh                     # STREAM this page's fresh payments before fetching the next
-        if len(payments) < PAGE_SIZE:      # fewer than a full page -> reached the oldest / `from`
+        if len(payments) < PAGE_SIZE:       # with a real `from`, the API honors the limit -> a short page is the end
             break
-        if not fresh:                       # no new rows -> stop, never loop
+        if not fresh:                       # no new rows (boundary page fully deduped) -> reached the oldest
             break
         positives = [c for c in (time_key(p) for p in payments if isinstance(p, dict)) if c > 0]
         if not positives:                   # nothing with a usable timestamp to advance the cursor
             break
-        nc = min(positives)                        # to is MICROseconds now (same as time) -> oldest time directly, inclusive
+        nc = min(positives)                        # oldest time (epoch MICROseconds) -> `to` for the next page, inclusive
         if cursor is not None and nc >= cursor:    # cursor didn't decrease -> avoid an infinite loop
             break
         cursor = nc
@@ -134,7 +120,24 @@ def fetch_funding_all(address, from_us=None, to_us=None, market=None):
     return [p for page in iter_funding_pages(address, from_us, to_us, market) for p in page]
 
 
-def print_table(payments, address, label, note):
+def fetch_funding(address, limit, from_us=None, to_us=None, market=None):
+    """Bounded --limit N: ONE request. With a real `from` floor (HISTORY_FROM_US when --from is unset) the API
+    HONORS `limit` and returns the newest N across ALL history (not the default recent window). Returns the list."""
+    q = {"address": address, "limit": limit, "from": from_us if from_us else HISTORY_FROM_US}
+    if to_us is not None:
+        q["to"] = to_us
+    if market is not None:
+        q["market"] = market
+    data = _get_json(f"{BASE}/v1/funding?{urllib.parse.urlencode(q)}", "funding")
+    payments = data.get("fundingPayments")
+    if payments is None:
+        return []
+    if not isinstance(payments, list):
+        raise SystemExit("display_funding: unexpected /v1/funding response ('fundingPayments' is not a list).")
+    return [p for p in payments if isinstance(p, dict)]
+
+
+def print_table(payments, address, label, note, truncated=False):
     """Aligned table with column widths sized to the data, plus a received/paid/net footer."""
     cols = [
         ("TIME (UTC)", "<", lambda p: when(p.get("time"))),
@@ -158,8 +161,13 @@ def print_table(payments, address, label, note):
     paid = sum((-a for a in amounts if a < 0), Decimal(0))
     net = received - paid
     print("-" * len(head))
-    print(f"  TOTAL  net {net:+,.6f}   (received {received:,.6f}, paid {paid:,.6f})   "
-          f"over {len(payments)} payment(s)")
+    if truncated:
+        # These sums cover ONLY the latest N payments shown, NOT full history -- never call that "TOTAL".
+        print(f"  SUBTOTAL (latest {len(payments)} payments shown -- NOT full history; use --limit unlimited)  "
+              f"net {net:+,.6f}   (received {received:,.6f}, paid {paid:,.6f})")
+    else:
+        print(f"  TOTAL  net {net:+,.6f}   (received {received:,.6f}, paid {paid:,.6f})   "
+              f"over {len(payments)} payment(s)")
 
 
 def main():
@@ -230,7 +238,7 @@ def main():
         truncated = False                         # paginated to completeness (within --from/--to + --market)
     else:
         raw = fetch_funding(args.address, args.limit, args.from_us, args.to_us, market=target_name)
-        truncated = len(raw) >= args.limit        # a full page back -> older payments may exist
+        truncated = len(raw) >= args.limit        # a full page (limit honored via the `from` floor) -> older payments may exist
     if len(raw) > TABLE_MAX_ROWS:
         raise SystemExit(
             f"display_funding: too many payments for a table (buffered > {TABLE_MAX_ROWS:,}). The table mode holds "
@@ -240,11 +248,9 @@ def main():
     payments.sort(key=time_key, reverse=True)      # enforce newest-first locally
 
     label = target_name if target_name else "ALL"
-    # Be honest about scope: the default window is only the last 30 days. With the server-side --market filter,
-    # a bounded --limit N returns the latest N payments OF THAT MARKET.
+    # Be honest about scope: a bounded --limit N returns the latest N payments across ALL history (we send a
+    # far-past `from` floor, so the API's "last 30 days when from is unset" default window does NOT apply here).
     notes = []
-    if args.from_us is None and args.limit != UNLIMITED:
-        notes.append("default window: last 30 days -- pass --from (epoch µs) or --limit unlimited for older history")
     if truncated:
         if target_name is not None:
             notes.append(f"latest {args.limit} {label} payments shown; older {label} payments may exist")
@@ -257,7 +263,7 @@ def main():
     if args.verbose:   # block dump: EVERY field of each payment (buffered set, like the table)
         print_verbose_records(payments, f"{len(payments)} funding payment(s) [{label}] for {args.address}{note}", time_keys={"time"})
     else:
-        print_table(payments, args.address, label, note)
+        print_table(payments, args.address, label, note, truncated=truncated)
 
 
 if __name__ == "__main__":

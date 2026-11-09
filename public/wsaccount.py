@@ -25,10 +25,19 @@ from arcus_common_public import SUB_ERR_LIMIT, CACHE_TTL, REDIS_URL, dec, descri
 # whole positions map (verified live), so no separate positions subscription / delta tracking is needed.
 CACHE_CHANNELS = {"account", "orders"}
 # Force a fresh `orders` snapshot this often so the delta-maintained openOrders set can't silently drift
-# (the one stateful cache; account/positions/markets self-correct via periodic full snapshots). The
-# resubscribe REPLACES the set only when the new snapshot arrives -- the old set stays published in the
-# meantime -- so there's no window where openOrders looks empty. 0 disables.
-ORDERS_RESUBSCRIBE_S = 60
+# (the one stateful cache; account/positions/markets self-correct via periodic full snapshots). We re-ground
+# with a read-only `get orders` RPC ({"type":"get","method":"orders"}) -- a SIDE-CHANNEL request that does NOT
+# touch the live `orders` SUBSCRIPTION, so the channel_data stream is never interrupted. The reply REPLACES the
+# set only when it arrives -- the old set stays published in the meantime -- so there's no window where
+# openOrders looks empty. 0 disables.
+# HISTORY: this used to unsubscribe+resubscribe the orders channel on the SAME socket every interval. That
+# fire-and-forget unsub/resub WEDGED the orders subscription -- live channel_data silently stalled for minutes
+# while the connection stayed up (ping/pong fine, other channels still flowing) -- surfacing as latency_test
+# log-watcher nulls and orders_stall_monitor "SILENT" stalls. A separate logger that NEVER resubscribes was
+# immune, which pinned the cause on the resub. The get-RPC re-grounds drift WITHOUT ever perturbing the
+# subscription, so the feed can't wedge. (The get reply's result.openOrders has the SAME element shape as the
+# subscription snapshot's contents.openOrders, so seed_orders handles both.)
+ORDERS_RESNAPSHOT_S = 60
 # Streaming order `state` (engine-authoritative per the docs) -> membership of the resting set.
 ORDER_STATE_RESTING  = {"OPEN", "PARTIALLY_FILLED"}
 ORDER_STATE_TERMINAL = {"FILLED", "CANCELED", "REJECTED"}
@@ -115,7 +124,7 @@ def seed_orders(contents):
     malformed element must NOT be silently DROPPED: dropping it (like a whole missing/non-list openOrders)
     yields an EMPTY/INCOMPLETE set that the caller would publish, and the reader treats a set MISSING a real
     resting order as 'no such quote' -> the market maker places DUPLICATE GTT orders instead of modify/cancel.
-    On None the caller KEEPS the last-good set (periodic resubscribe self-heals). An EXPLICIT empty list is valid
+    On None the caller KEEPS the last-good set (the periodic get-orders re-snapshot self-heals). An EXPLICIT empty list is valid
     (genuinely no open orders) and returns {}. An order WITHOUT a clientId is SKIPPED (not one of the MM's, which
     are keyed by clientId) -- consistent with the delta path -- WITHOUT rejecting the whole snapshot (clientId-less
     frontend orders are legit, unlike a missing orderId). recentClosedOrders is ignored."""
@@ -145,7 +154,7 @@ def apply_order_update(orders, contents):
     OPEN/PARTIALLY_FILLED -> upsert; FILLED/CANCELED/REJECTED -> remove -- EXCEPT a CANCELED whose
     cancelReason is MODIFY_CANCELED, the transient cancel-leg of a modify, which is KEPT (the same orderId
     is re-placed on the next update). An update with an unrecognized/missing state leaves the set UNCHANGED
-    (conservative -- the periodic resubscribe self-heals any drift).
+    (conservative -- the periodic get-orders re-snapshot self-heals any drift).
     Returns True if the set changed (so the caller only republishes on a real change)."""
     if not isinstance(contents, dict):
         return False
@@ -156,14 +165,14 @@ def apply_order_update(orders, contents):
     if state in ORDER_STATE_RESTING:
         if not contents.get("clientId"):     # our-order identity is by clientId; upserting a resting order WITHOUT
             return False                      # one would read as not-ours -> DUPLICATE. Skip -> keep the last-good
-        orders[oid] = contents               # (clientId-bearing) version of this order; the resubscribe self-heals.
+        orders[oid] = contents               # (clientId-bearing) version of this order; the re-snapshot self-heals.
         return True
     if state in ORDER_STATE_TERMINAL:
         # MODIFY_CANCELED = the FIRST leg of a modify: the SAME orderId is re-placed by the very next update,
         # so it is NOT terminally gone (docs). Removing here would flicker the order OUT of the shared cache on
         # every modify -- the MM (which reads this cache) would then see its order briefly missing and pay a
         # fresh re-read via its stale-cache safeguard. Keep the existing cached order; the imminent re-place
-        # upserts its fresh state, and a dropped follow-up self-heals via the 60s resubscribe. Only a GENUINE
+        # upserts its fresh state, and a dropped follow-up self-heals via the 60s get-orders re-snapshot. Only a GENUINE
         # terminal cancel (no marker) / FILLED / REJECTED removes it.
         if contents.get("cancelReason") == "MODIFY_CANCELED":
             return False
@@ -184,6 +193,31 @@ async def handle_message(raw, loggers, add_ts, pub, ctx, state):
         return
     if not isinstance(msg, dict):          # valid JSON but not an object (bare array/number) -> STDOUT, keep reading
         print(raw)
+        return
+    # `get orders` RPC reply (type:get, method:orders) -- the periodic re-ground. It is NOT a channel frame
+    # (no `channel`, carries `method`/`result`), so handle it HERE, before the channel-less error gate below
+    # (a failed get is channel-less with status>=400 and would otherwise raise -> full reconnect) and before the
+    # channel router (which would dump the 200-order result to stdout). status 200 => re-seed the resting set
+    # from result.openOrders (same element shape as the subscription snapshot, so seed_orders works verbatim);
+    # any other status / malformed result => KEEP the last-good set and never raise -- a failed re-ground is
+    # non-fatal, exactly like the old best-effort resubscribe.
+    if msg.get("method") == "orders" and msg.get("channel") is None:
+        if pub is None:
+            return
+        if msg.get("status") == 200:
+            seeded = seed_orders(msg.get("result"))
+            if seeded is None:
+                print(f"[{log_ts()}] [wsaccount] orders get-snapshot malformed; keeping last-good resting set",
+                      file=sys.stderr)
+            else:
+                state["orders"] = seeded
+                state["orders_seeded"] = True
+                network, address = ctx
+                blob = {"orders": list(state["orders"].values())}
+                await _warm(pub, state, acct_key(network, address, "openOrders"), "openOrders", blob)
+        else:
+            print(f"[{log_ts()}] [wsaccount] orders get-snapshot failed (status {msg.get('status')}); "
+                  "keeping last-good resting set", file=sys.stderr)
         return
     # Server subscription/request error (channel-less frame with an `error` object or status >= 400): raise so
     # ws_loop reconnects instead of sitting on a dead subscription. Channel-less gate => real frames never match.
@@ -225,7 +259,7 @@ async def handle_message(raw, loggers, add_ts, pub, ctx, state):
                       "with no orderId); keeping last-good resting set", file=sys.stderr)                      # last-good
             else:                                                                                             # (dup-quote
                 state["orders"] = seeded              # atomic replace (explicit list -- empty or populated)  # risk);
-                state["orders_seeded"] = True         # a VALID snapshot grounds the set -- publish from here  # resub heals
+                state["orders_seeded"] = True         # a VALID snapshot grounds the set -- publish from here  # re-snap heals
                 changed = True
         elif typ == "channel_data":
             changed = apply_order_update(state["orders"], contents)
@@ -263,11 +297,13 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_inter
                 if pub is not None:
                     _, address = ctx
                     orders_subbed = any(s.get("channel") == "orders" for s in subscriptions)
-                    next_resub = (time.monotonic() + ORDERS_RESUBSCRIBE_S
-                                  if orders_subbed and ORDERS_RESUBSCRIBE_S > 0 else None)
+                    next_resnapshot = (time.monotonic() + ORDERS_RESNAPSHOT_S
+                                       if orders_subbed and ORDERS_RESNAPSHOT_S > 0 else None)
+                    rpc_id = 0                      # strictly-increasing per-connection id for get/post RPCs
                     # Redis present: on-change writes happen in handle_message; here we add (a) the HEARTBEAT
-                    # republish so short-TTL keys never expire between snapshots, and (b) the periodic forced
-                    # `orders` re-snapshot so the delta-maintained openOrders set can't silently drift.
+                    # republish so short-TTL keys never expire between snapshots, and (b) the periodic `get
+                    # orders` RPC that re-grounds the delta-maintained openOrders set WITHOUT touching the live
+                    # subscription (so the channel_data stream never stalls -- see ORDERS_RESNAPSHOT_S).
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=HEARTBEAT)
@@ -279,14 +315,17 @@ async def ws_loop(url, subscriptions, loggers, add_ts, pub, ctx, reconnect_inter
                             if now - state["last_pub"].get(name, 0.0) >= HEARTBEAT:
                                 state["last_pub"][name] = now
                                 await pub.publish(key, blob)
-                        if next_resub is not None and now >= next_resub:
-                            next_resub = now + ORDERS_RESUBSCRIBE_S
-                            # Re-request the snapshot; handle_message atomically REPLACES state["orders"] when
-                            # the new `subscribed` frame lands, so the previously-published set stays valid in
-                            # the gap (never an empty openOrders). A send failure just retries next interval.
+                        if next_resnapshot is not None and now >= next_resnapshot:
+                            next_resnapshot = now + ORDERS_RESNAPSHOT_S
+                            # Read-only `get orders` side-channel: the reply (method:orders, status:200) lands in
+                            # this same recv loop and handle_message atomically REPLACES state["orders"] from it
+                            # -- the previously-published set stays valid until then (never an empty openOrders).
+                            # A send failure just retries next interval. This NEVER unsubscribes, so the live
+                            # orders channel_data stream is never interrupted (the old unsub/resub wedged it).
+                            rpc_id += 1
                             try:
-                                await ws.send(json.dumps({"type": "unsubscribe", "channel": "orders", "id": address}))
-                                await ws.send(json.dumps({"type": "subscribe", "channel": "orders", "id": address, "snapshot": True}))
+                                await ws.send(json.dumps({"type": "get", "id": rpc_id, "request": {
+                                    "type": "orders", "payload": {"address": address, "accountIndex": 0}}}))
                             except Exception:
                                 pass
                 else:
@@ -365,7 +404,7 @@ async def amain(args):
             names = ["account", "positions"] if "account" in warmed else []
             names += ["openOrders"] if "orders" in warmed else []
             print(f"  warming Redis keys (TTL {CACHE_TTL}s, heartbeat {HEARTBEAT}s,"
-                  f" orders re-snapshot {ORDERS_RESUBSCRIBE_S}s):")
+                  f" orders re-snapshot {ORDERS_RESNAPSHOT_S}s via get-orders RPC):")
             for n in names:
                 print(f"    {acct_key(args.network, address, n)}")
         else:

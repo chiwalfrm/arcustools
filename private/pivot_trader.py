@@ -50,6 +50,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -300,6 +301,83 @@ def log_trade(market, side, filled, order_id, address, account_index):
         log(f"WARNING could not append trade log {path}: {e}")
 
 
+# ── TWAP delegation (--twap): hand the pivot's delta to twap.py over a window ──────
+def twap_state_path(network, market, side):
+    """Where twap.py writes its state (same formula twap.py uses), in the CWD."""
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in f"{network}_{market}_{side}")
+    return os.path.join(os.getcwd(), f"twap_state_{safe}.json")
+
+
+def _fold_twap_fill(state, path, market_name, trade_side, ts_path, rc):
+    """Fold the ACTUAL TWAP fill (from twap.py's state file) into the pivot's own position; clear twap_pending.
+    One aggregate row (total qty + VWAP) is written to the pivot trade log; twap.py keeps the per-slice rows."""
+    filled, vwap = Decimal(0), None
+    try:
+        with open(ts_path) as f:
+            ts = json.load(f)
+        filled = dec(ts.get("filled_base")) or Decimal(0)
+        fu = dec(ts.get("filled_usd")) or Decimal(0)
+        if filled > 0:
+            vwap = fu / filled
+    except (OSError, json.JSONDecodeError):
+        pass
+    if filled < 0:
+        filled = Decimal(0)
+    signed = filled if trade_side == "BUY" else -filled
+    state["position"] = str((dec(state["position"]) or Decimal(0)) + signed)
+    state["twap_pending"] = None
+    save_state(path, state)
+    if filled > 0:
+        epoch = int(time.time())
+        dt = datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+        try:
+            with open(os.path.join(os.getcwd(), TRADES_LOG_NAME), "a") as f:
+                f.write(f"{dt},{epoch},{market_name},{trade_side},{_plain(filled)},{_plain(vwap)}\n")
+        except OSError as e:
+            log(f"WARNING could not append trade log: {e}")
+    log(f"[{market_name}] TWAP done (rc={rc}): {trade_side} filled {filled}" + (f" @ VWAP {vwap}" if vwap else "")
+        + f"; position -> {state['position']}")
+
+
+def run_via_twap(args, market_name, trade_side, size, state, path):
+    """Delegate a pivot trade of `size` to twap.py (BLOCKING), then fold the real fill from its state file. The
+    pivot's flock is held throughout, so overlapping cron runs are skipped while the TWAP executes."""
+    duration, slices = args.twap
+    twap_prog = os.path.join(_HERE, "twap.py")
+    if not os.path.exists(twap_prog):
+        log(f"[{market_name}] --twap set but {twap_prog} not found; NOT trading this run.")
+        return
+    ts_path = twap_state_path(args.network, market_name, trade_side)
+    try:
+        os.remove(ts_path)                                # clean slate -> we read ONLY this run's fill
+    except OSError:
+        pass
+    state["twap_pending"] = {"side": trade_side, "size": _plain(size),
+                             "twap_state": os.path.basename(ts_path), "started_at": _now_iso()}
+    save_state(path, state)                               # crash-safe: record BEFORE launching
+    cmd = [sys.executable, twap_prog, "--market", market_name, "--side", trade_side, "--quantity", _plain(size),
+           "--duration", str(duration), "--slices", str(slices), f"--{args.network}"]
+    log(f"[{market_name}] --twap: delegating {trade_side} {_plain(size)} to twap.py over {duration}s / {slices} slices ...")
+    try:
+        rc = subprocess.call(cmd)                          # BLOCKING; stdout/stderr inherited (shows in the cron log)
+    except Exception as e:
+        rc = -1
+        log(f"[{market_name}] twap.py failed to launch ({e}); reconciling from its state file.")
+    _fold_twap_fill(state, path, market_name, trade_side, ts_path, rc)
+
+
+def recover_twap(state, path, market_name, tag=""):
+    """Crash recovery: a prior run left a `twap_pending` (launched a TWAP but didn't record completion). Fold the
+    TWAP's recorded fill and clear it. VERIFY no twap.py is still running for this market/side first."""
+    tp = state.get("twap_pending")
+    if not tp:
+        return
+    ts_path = os.path.join(os.getcwd(), tp.get("twap_state", ""))
+    log(f"{tag}recovering an interrupted TWAP ({tp.get('side')} {tp.get('size')}) from a prior run -- folding its "
+        f"recorded fill (verify no twap.py is still running).")
+    _fold_twap_fill(state, path, market_name, tp.get("side") or "BUY", ts_path, rc="recovered")
+
+
 def settle_pending(address, account_index, state, path, market_name, tag=""):
     """If a `pending_order_id` is recorded (a prior run placed an order but crashed before accounting for it),
     read its definitive fill and fold it into `position`, then clear it. If the order still isn't terminal,
@@ -319,12 +397,16 @@ def settle_pending(address, account_index, state, path, market_name, tag=""):
     log(f"{tag}reconciled pending order {oid}: {side} filled {filled} (status {status}); position -> {state['position']}")
 
 
-def execute_trade(signer, address, account_index, mkt, trade_side, size, state, path):
+def execute_trade(signer, address, account_index, mkt, trade_side, size, state, path, force=False):
     """Place a MARKET IOC for `size` (Decimal > 0) on `trade_side`, then read the DEFINITIVE fill and fold it
     into `position`. Records `pending_order_id` BEFORE reading the fill so a crash mid-read is reconciled next
-    run (not double-traded). A slippage-guard block just skips this run (position unchanged; retried next)."""
+    run (not double-traded). A slippage-guard block just skips this run (position unchanged; retried next).
+    force=True (from --force-market): price the protective bound off the MARK (mark +/- 9%) and SKIP the 3%
+    slippage guard, instead of the tight worst-book-level +/- 1% bound. Use when the book snapshot can't be
+    trusted to price a crossable bound (e.g. a volatile/stale testnet book where a normal bound IOC_CANCELs).
+    The bound is a CEILING, not the fill price -- fills still clear at the best book prices up to the bound."""
     market_name = mkt.get("marketDisplayName", "?")
-    result = place_market_ioc(signer, address, account_index, mkt, trade_side, size)
+    result = place_market_ioc(signer, address, account_index, mkt, trade_side, size, force=force)
     if not result["placed"]:
         log(f"[{market_name}] NOT PLACED ({result['reason']}; mid={result['mid']}, est fill={result['avg_fill']}) "
             f"-- position unchanged, will retry next run")
@@ -346,7 +428,8 @@ def execute_trade(signer, address, account_index, mkt, trade_side, size, state, 
     if filled > 0:                                       # record the actual fill (qty + looked-up VWAP price) in the trade history
         log_trade(market_name, side, filled, order_id, address, account_index)
     short = "" if result["enough"] else " [book thinner than size -- partial]"
-    log(f"[{market_name}] {trade_side} {size} @ bound {result['bound']} (est slippage {result['slippage'] * 100:.3f}%): "
+    boundtag = " mark-bound/force" if force else ""
+    log(f"[{market_name}] {trade_side} {size} @ bound {result['bound']}{boundtag} (est slippage {result['slippage'] * 100:.3f}%): "
         f"orderId {order_id} status {status} filled {filled}{short}; position -> {state['position']}")
 
 
@@ -388,7 +471,7 @@ def do_init(args):
     starting_side = side_of(oracle, pivot)
     now = _now_iso()
     state = {"pivot": str(pivot), "quantity": str(q), "starting_side": starting_side, "direction": direction,
-             "position": "0", "pending_order_id": None, "created_at": now, "updated_at": now}
+             "position": "0", "pending_order_id": None, "twap_pending": None, "created_at": now, "updated_at": now}
     save_state(path, state)
     mode_note = {"both": "flip +q<->-q", "long": "LONG-ONLY (flatten on bearish)",
                  "short": "SHORT-ONLY (flatten on bullish)"}[direction]
@@ -434,6 +517,7 @@ def do_run(args):
         log(f"[{market_name}] pending order {state['pending_order_id']} not yet reconciled -- position may be "
             f"stale; NOT trading this run (will reconcile next run)")
         return
+    recover_twap(state, path, market_name, tag=f"[{market_name}] ")   # fold an interrupted --twap execution
     position = dec(state["position"])
 
     if position == 0 and side == starting_side:
@@ -446,7 +530,12 @@ def do_run(args):
         log(f"[{market_name}] oracle={oracle} -> {side}; position {position} at/near target {target} "
             f"({direction}); delta {delta} < min {ms}; no trade")
         return
-    execute_trade(signer, address, account_index, mkt, "BUY" if delta > 0 else "SELL", abs(delta), state, path)
+    trade_side = "BUY" if delta > 0 else "SELL"
+    if args.twap:
+        run_via_twap(args, market_name, trade_side, abs(delta), state, path)
+    else:
+        execute_trade(signer, address, account_index, mkt, trade_side, abs(delta), state, path,
+                      force=args.force_market)
 
 
 # ── --reconcile-only: manual repair (fold in a pending fill; no oracle, no trade, no bias change) ──
@@ -468,19 +557,22 @@ def do_reconcile(args):
         raise SystemExit(f"{PROG}: state file {os.path.basename(path)} has a missing/non-numeric 'position'.")
 
     pending = state.get("pending_order_id")
-    if not pending:
-        log(f"[{args.market}] reconcile-only: no pending order; position {state['position']} unchanged (nothing to do)")
+    twapp = state.get("twap_pending")
+    if not pending and not twapp:
+        log(f"[{args.market}] reconcile-only: nothing pending; position {state['position']} unchanged (nothing to do)")
         return
 
-    creds = load_creds()                                     # address+accountIndex to READ the order/fills (no signer -- we never place)
-    address, account_index = creds["eth_address"], creds["account_index"]
     before = state["position"]
-    settle_pending(address, account_index, state, path, args.market, tag=f"[{args.market}] reconcile-only: ")
+    if twapp:                                               # fold an interrupted TWAP (reads twap.py's state file; no network)
+        recover_twap(state, path, args.market, tag=f"[{args.market}] reconcile-only: ")
+    if pending:
+        creds = load_creds()                                # address+accountIndex to READ the order/fills (no signer -- we never place)
+        address, account_index = creds["eth_address"], creds["account_index"]
+        settle_pending(address, account_index, state, path, args.market, tag=f"[{args.market}] reconcile-only: ")
     if state.get("pending_order_id"):
         log(f"[{args.market}] reconcile-only: pending order {pending} still not confirmed; position "
-            f"{state['position']} unchanged -- retry later (NO oracle read, NO trade)")
-    else:
-        log(f"[{args.market}] reconcile-only: done; position {before} -> {state['position']} (NO oracle read, NO trade)")
+            f"{state['position']} unchanged for it -- retry later.")
+    log(f"[{args.market}] reconcile-only: done; position {before} -> {state['position']} (NO oracle read, NO trade)")
 
 
 def main():
@@ -496,6 +588,17 @@ def main():
                         "fresh-order 404). No-op if nothing is pending.")
     p.add_argument("--pivot", help="pivot price (required with --init; ignored otherwise)")
     p.add_argument("--quantity", help="position size q in base-asset units (required with --init; ignored otherwise)")
+    p.add_argument("--force-market", action="store_true",
+                   help="price the MARKET IOC's protective bound off the MARK (mark +/- 9%%) and SKIP the 3%% "
+                        "slippage guard, instead of the default worst-book-level +/- 1%% bound. Per-run flag (pass "
+                        "it on every cron invocation; NOT stored in state). Use when the book snapshot can't price "
+                        "a crossable bound -- e.g. a volatile/stale testnet book where a normal MARKET IOC "
+                        "IOC_CANCELs. The bound is a CEILING (you still fill at the best book prices up to it), but "
+                        "it trades slippage protection for fill-certainty -- fills can land up to ~9%% off mark.")
+    p.add_argument("--twap", default=None,
+                   help="execute the pivot trade as a TWAP via twap.py (same dir) instead of one market order: "
+                        "DURATION/SLICES, e.g. 3600/12 (DURATION seconds, SLICES child orders). Per-run flag -- pass "
+                        "it on every cron invocation. The run BLOCKS for the whole window (later cron ticks skip on the lock).")
     bias = p.add_mutually_exclusive_group()
     bias.add_argument("--long-only", action="store_true",
                       help="directional bias, locked at --init: only ever hold +q. A bearish flip FLATTENS to 0 "
@@ -508,6 +611,17 @@ def main():
 
     if args.init and args.reconcile_only:
         raise SystemExit(f"{PROG}: --init and --reconcile-only are mutually exclusive.")
+    if args.twap is not None:
+        parts = args.twap.split("/")
+        try:
+            if len(parts) != 2:
+                raise ValueError
+            d, s = int(parts[0]), int(parts[1])
+        except (ValueError, AttributeError):
+            raise SystemExit(f"{PROG}: --twap must be DURATION/SLICES, e.g. 3600/12 (got {args.twap!r}).")
+        if d < 0 or s < 1:
+            raise SystemExit(f"{PROG}: --twap needs DURATION>=0 and SLICES>=1 (got {d}/{s}).")
+        args.twap = (d, s)
 
     if args.init:
         if not args.pivot or not args.quantity:
