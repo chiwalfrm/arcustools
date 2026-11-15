@@ -9,6 +9,15 @@ MARKET (no --price): orderType=MARKET, --tif defaults to IOC (override with --ti
   python3 place_order.py --market BTC-USD --quantity 0.5
   python3 place_order.py --market BTC-USD --side SELL --quantity 0.5 --force
 
+TRIGGER / stop-loss / take-profit (--trigger is the trigger/stop price; --tpsl sl|tp, default sl):
+  Standalone conditional order via POST /v1/placeOrder with tpslType + stopPrice, signed op=4 (untriggered).
+  # stop-loss MARKET: SELL 10.99 ZEC-USD when mark drops to/through 901.2 (no --price => market on trigger):
+  python3 place_order.py --market ZEC-USD --side SELL --quantity 10.99 --trigger 901.2 --reduce-only
+  # stop-loss LIMIT: same trigger, rest a GTT limit at 895 when it fires (give --price):
+  python3 place_order.py --market ZEC-USD --side SELL --quantity 10.99 --trigger 901.2 --price 895 --reduce-only
+  # --tpsl tp = take-profit (forced reduce-only). A stop-loss is almost always --reduce-only too.
+  # Fires on MARK price; a trigger already on the wrong side of mark is rejected (InvalidRequest).
+
 Sizing -- give exactly one of --quantity / --quantityusd:
   --quantity      order size in base-asset units (e.g. 0.5 BTC).
   --quantityusd   spend this many USD; the coin quantity is derived -- from --price
@@ -35,7 +44,7 @@ import os
 import sys
 import time
 import urllib.parse
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
 # Resolve ordersign / arcus_common_private / arcus_creds_<network>.json relative to THIS script
 # (in private/), so it works from any cwd and can't import a stray module.
@@ -58,6 +67,11 @@ TIFS = {"GTT": ordersign.TIF_GTC, "FOK": ordersign.TIF_FOK,
 # (incl. IOC/FOK/market -- IOC/market won't actually rest, but the field is
 # validated). 365 days clears the minimum with a wide margin.
 GOOD_TIL_DAYS = 365
+
+# For a TPSL MARKET leg the venue still requires a price, validated to within 10% of stopPrice (NOT live mark).
+# Push the execution price THROUGH the trigger by this fraction so it fills like a market order when it fires.
+# Must stay < 0.10 to clear the server's 10%-of-stopPrice band.
+TRIGGER_MARKET_SLIP = Decimal("0.05")
 
 
 # ── place_order-specific helpers ──────────────────────────────────────────────
@@ -98,9 +112,14 @@ def parse_args():
     qty_group = parser.add_mutually_exclusive_group(required=True)
     qty_group.add_argument("--quantity", help="order size in base-asset units (decimal > 0)")
     qty_group.add_argument("--quantityusd", help="order size in USD (decimal > 0); rounded DOWN to step")
-    parser.add_argument("--price", default=None, help="limit price (decimal > 0). Omit for a MARKET order.")
+    parser.add_argument("--price", default=None, help="limit price (decimal > 0). Omit for a MARKET order. "
+                        "With --trigger: given => stop-LIMIT at this price; omitted => stop-MARKET on trigger.")
+    parser.add_argument("--trigger", default=None, help="trigger (stop) price (decimal > 0): makes this a TPSL / "
+                        "conditional order. Fires when mark price reaches it. See --tpsl.")
+    parser.add_argument("--tpsl", default="sl", choices=["sl", "tp"],
+                        help="for --trigger orders: 'sl' stop-loss (default) or 'tp' take-profit (forced reduce-only).")
     parser.add_argument("--tif", default=None, choices=list(TIFS),
-                        help="time-in-force (default GTT for limit, IOC for market)")
+                        help="time-in-force (default GTT for limit, IOC for market; forced for trigger orders)")
     parser.add_argument("--reduce-only", action="store_true", help="reduce-only order")
     parser.add_argument("--clientid", "--client-id", dest="client_id",
                         help="client-assigned order id (1-36 chars, [A-Za-z0-9_-])")
@@ -113,7 +132,8 @@ def parse_args():
 def main():
     args = parse_args()
     select_network(args.network)
-    is_market = args.price is None
+    is_trigger = args.trigger is not None
+    is_market = args.price is None and not is_trigger   # a trigger order with no --price is a stop-MARKET, not a plain MARKET
     tif = args.tif or ("IOC" if is_market else "GTT")
     # Server rule: MARKET orders must be IOC (no resting/FOK market orders).
     if is_market and tif != "IOC":
@@ -126,6 +146,8 @@ def main():
     # --- Validate all inputs locally, before any signing/sending --------------
     if args.price is not None:
         positive_decimal(args.price, "--price")
+    if args.trigger is not None:
+        positive_decimal(args.trigger, "--trigger")
     if args.quantity is not None:
         positive_decimal(args.quantity, "--quantity")
     if args.quantityusd is not None:
@@ -133,7 +155,8 @@ def main():
     if args.client_id is not None:
         validate_client_id(args.client_id)
     if args.force and not is_market:
-        print("note: --force is ignored for limit orders (slippage guard is market-only).")
+        where = "trigger orders" if is_trigger else "limit orders"
+        print(f"note: --force is ignored for {where} (slippage guard is plain-market-only).")
 
     creds = load_creds()
     address = creds["eth_address"]
@@ -212,15 +235,48 @@ def main():
         print("Order response:", json.dumps(result["order"], indent=2))   # helper already check_order_response'd it
         return
     else:
-        order_type = "LIMIT"
-        price = str(args.price)
+        stop_price = None
+        tpsl_type = None
+        if is_trigger:
+            # Conditional (stop-loss / take-profit) order -> POST /v1/placeOrder with tpslType + stopPrice,
+            # signed with op=4 (OP_PLACE_UNTRIGGERED). stopPrice/tpslType are body-only (NOT signed); only the
+            # signed `op` differs from a plain order. Fires on MARK price reaching stopPrice.
+            tpsl_type = "STOP_LOSS" if args.tpsl == "sl" else "TAKE_PROFIT"
+            stop_price = str(args.trigger)
+            if tpsl_type == "TAKE_PROFIT" and not args.reduce_only:
+                args.reduce_only = True        # venue requires TAKE_PROFIT to be reduce-only
+                print("note: TAKE_PROFIT orders must be reduce-only; enabling --reduce-only.")
+            forced_tif = "GTT" if args.price is not None else "IOC"   # venue: TPSL LIMIT=GTT, MARKET leg=IOC
+            if args.tif is not None and args.tif != forced_tif:
+                print(f"note: --tif {args.tif} ignored for a trigger {'LIMIT' if args.price is not None else 'MARKET'} "
+                      f"order; using {forced_tif} (venue requirement).")
+            tif = forced_tif
+            if args.price is not None:
+                order_type = "LIMIT"
+                price = str(args.price)
+            else:
+                order_type = "MARKET"
+                # A TPSL MARKET leg still carries a price (server-validated within 10% of stopPrice, not live mark).
+                # Push it THROUGH the stop by TRIGGER_MARKET_SLIP so it fills like market; align to a tick multiple.
+                st = Decimal(stop_price)
+                raw = st * (Decimal(1) + TRIGGER_MARKET_SLIP) if args.side == "BUY" else st * (Decimal(1) - TRIGGER_MARKET_SLIP)
+                rounding = ROUND_FLOOR if args.side == "BUY" else ROUND_CEILING
+                price = f"{round_to_increment(raw, tick_size, rounding):f}"
+        else:
+            order_type = "LIMIT"
+            price = str(args.price)
         if usd_mode:
             qty = to_step(Decimal(args.quantityusd) / Decimal(price), step_size)
             print(f"USD {args.quantityusd} @ {price} -> quantity {qty:f} (rounded to step {step_size})")
         else:
             qty = Decimal(args.quantity)
-        print(f"{args.market} (marketId {market_id})  LIMIT {args.side} {qty:f} @ {price}"
-              f"  tick={tick_size} step={step_size}")
+        if is_trigger:
+            print(f"{args.market} (marketId {market_id})  {tpsl_type} {order_type} {args.side} {qty:f}  "
+                  f"trigger={stop_price} price={price} tif={tif}"
+                  + (" reduce-only" if args.reduce_only else "") + f"  tick={tick_size} step={step_size}")
+        else:
+            print(f"{args.market} (marketId {market_id})  LIMIT {args.side} {qty:f} @ {price}"
+                  f"  tick={tick_size} step={step_size}")
 
     # Pre-validate the final size/notional against the market's bounds -> a clear error BEFORE signing (else the
     # venue rejects with OrderSizeTooLarge / a min-size / min-notional reason). Each bound is skipped when absent.
@@ -232,6 +288,7 @@ def main():
                          f"(maxOrderSize) -- reduce --quantity/--quantityusd.")
     _price_dec = dec(str(price))
     if (min_order_notional is not None and min_order_notional > 0 and _price_dec is not None
+            and not (is_trigger and args.reduce_only)   # venue exempts reduce-only (incl. TPSL) from min-notional
             and qty * _price_dec < min_order_notional):
         raise SystemExit(f"{args.market}: order notional {qty * _price_dec:f} is below the market minimum "
                          f"{min_order_notional:f} (minOrderNotional) -- increase the size.")
@@ -251,12 +308,31 @@ def main():
 
     # --- Sign the typed payload, then POST the REST body ----------------------
     ct = time.time_ns() + delta_ns           # server-aligned; also the X-Timestamp
-    headers = signer.sign_place_order(
-        address=address, account_index=account_index, client_id=args.client_id,
-        client_timestamp_ns=ct, good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
-        market_id=market_id, price_ticks=price_ticks, quantity_quantums=quantity_quantums,
-        reduce_only=args.reduce_only, side=SIDES[args.side], time_in_force=TIFS[tif],
-    )
+    if is_trigger:
+        # A TPSL / conditional order must be signed with op=4 (OP_PLACE_UNTRIGGERED). The signed canonical payload
+        # is IDENTICAL to a plain op=1 placeOrder except the op value (stopPrice/tpslType are body-only, unsigned).
+        # We produce it WITHOUT modifying the vendored ordersign.py: build the normal (op=1) payload with its public
+        # builder, swap the single op field, then sign with the same Ed25519 key the Signer holds.
+        payload = ordersign.place_order_payload(
+            address=address, account_index=account_index, client_id=args.client_id,
+            client_timestamp_ns=ct, good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
+            market_id=market_id, price_ticks=price_ticks, quantity_quantums=quantity_quantums,
+            reduce_only=args.reduce_only, side=SIDES[args.side], time_in_force=TIFS[tif],
+        )
+        marker = f'"op":{ordersign.OP_PLACE},'
+        if marker not in payload:   # fail CLOSED: if the canonical format ever changes, don't send a bad signature
+            raise SystemExit(f"{PROG}: cannot build a TPSL signature -- ordersign canonical payload format changed "
+                             f"(expected {marker!r} in the op=1 payload). Not sending.")
+        payload = payload.replace(marker, f'"op":{ordersign.OP_PLACE_UNTRIGGERED},', 1)
+        sig = signer._priv.sign(payload.encode())   # same key/primitive ordersign.sign_place_order uses internally
+        headers = {"X-API-Key": signer.pub_hex, "X-Timestamp": str(ct), "X-Signature": sig.hex()}
+    else:
+        headers = signer.sign_place_order(
+            address=address, account_index=account_index, client_id=args.client_id,
+            client_timestamp_ns=ct, good_til_time_ns_=ordersign.good_til_time_ns(good_til_us),
+            market_id=market_id, price_ticks=price_ticks, quantity_quantums=quantity_quantums,
+            reduce_only=args.reduce_only, side=SIDES[args.side], time_in_force=TIFS[tif],
+        )
     body = {
         "address": address, "accountIndex": account_index, "marketId": market_id,
         "orderSide": args.side, "orderType": order_type, "quantity": qty_str,
@@ -265,6 +341,9 @@ def main():
     }
     if args.reduce_only:
         body["reduceOnly"] = True
+    if is_trigger:
+        body["tpslType"] = tpsl_type          # STOP_LOSS | TAKE_PROFIT (body-only; not part of the signed payload)
+        body["stopPrice"] = stop_price        # trigger price in human USD (body-only)
     if args.client_id:
         body["clientId"] = args.client_id
 
